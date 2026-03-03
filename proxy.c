@@ -1,16 +1,11 @@
 /*
- * proxy.c - A concurrent HTTP/1.0 Proxy Server
+ * proxy.c - Concurrent HTTP Proxy Server
  * CS3001 - Computer Networks, Assignment #1
  * FAST-NUCES Karachi, Spring 2026
  *
- * Features:
- *   - Handles concurrent client requests using fork()
- *   - Supports HTTP/1.0 GET method only
- *   - Returns 501 for non-GET methods
- *   - Returns 400 for malformed requests
- *   - Parses absolute URIs (host, port, path)
- *   - Configurable port via command line
- *   - Max 100 concurrent child processes
+ * Accepts HTTP/1.0 and HTTP/1.1 from browsers,
+ * forwards as HTTP/1.0 to origin servers.
+ * Uses fork() for concurrency, max 100 processes.
  */
 
 #include <stdio.h>
@@ -26,109 +21,89 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
-/* ─── Constants ─────────────────────────────────────────────── */
-#define BUFFER_SIZE      65536   /* 64 KB read/write buffer      */
-#define MAX_HEADER_SIZE  8192    /* Max incoming header size      */
-#define MAX_PROCESSES    100     /* Max concurrent child procs    */
-#define DEFAULT_HTTP_PORT 80     /* Default HTTP port             */
+/* ── Constants ──────────────────────────────────────────── */
+#define BUFFER_SIZE       65536
+#define MAX_HEADER_SIZE   16384   /* increased: browsers send big headers */
+#define MAX_PROCESSES     100
+#define DEFAULT_HTTP_PORT 80
 
-/* ─── Parsed request structure ──────────────────────────────── */
+/* ── Request struct ─────────────────────────────────────── */
 typedef struct {
     char method[16];
     char host[256];
     int  port;
     char path[4096];
     char version[16];
-    char headers[MAX_HEADER_SIZE]; /* raw headers after request line */
 } HTTPRequest;
 
-/* ─── Global child-process counter ──────────────────────────── */
+/* ── Global child counter ───────────────────────────────── */
 volatile int child_count = 0;
 
-/* ══════════════════════════════════════════════════════════════
- *  Signal Handlers
- * ══════════════════════════════════════════════════════════════ */
-
-/* Reap zombie children and decrement counter */
+/* ════════════════════════════════════════════════════════
+ *  SIGCHLD – reap zombies
+ * ════════════════════════════════════════════════════════ */
 void sigchld_handler(int sig) {
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0)
         child_count--;
 }
 
-/* ══════════════════════════════════════════════════════════════
- *  Error Response Helpers
- * ══════════════════════════════════════════════════════════════ */
-
+/* ════════════════════════════════════════════════════════
+ *  Error senders
+ * ════════════════════════════════════════════════════════ */
 void send_error(int fd, int code, const char *reason, const char *body) {
-    char response[1024];
-    snprintf(response, sizeof(response),
+    char resp[1024];
+    snprintf(resp, sizeof(resp),
         "HTTP/1.0 %d %s\r\n"
         "Content-Type: text/html\r\n"
         "Connection: close\r\n"
         "\r\n"
         "<html><body><h1>%d %s</h1><p>%s</p></body></html>\r\n",
         code, reason, code, reason, body);
-    send(fd, response, strlen(response), 0);
+    send(fd, resp, strlen(resp), 0);
 }
 
-void send_400(int fd) {
-    send_error(fd, 400, "Bad Request",
-               "Your browser sent a request the proxy could not understand.");
-}
-
-void send_501(int fd) {
-    send_error(fd, 501, "Not Implemented",
-               "The proxy only supports the GET method.");
-}
-
-/* ══════════════════════════════════════════════════════════════
- *  URL / Header Parser
- * ══════════════════════════════════════════════════════════════ */
-
-/*
- * parse_request()
- *
- * Reads a raw HTTP request from the client socket and fills in
- * an HTTPRequest struct.
- *
- * Returns:
- *   1  – success
- *   0  – bad request (400)
- *  -1  – not implemented (501)
- */
-int parse_request(int client_fd, HTTPRequest *req) {
-    char raw[MAX_HEADER_SIZE];
-    memset(raw, 0, sizeof(raw));
-
-    /* ── Read data until we see the blank line (\r\n\r\n) ── */
+/* ════════════════════════════════════════════════════════
+ *  Read full headers from socket (until \r\n\r\n)
+ * ════════════════════════════════════════════════════════ */
+int read_headers(int fd, char *buf, int bufsz) {
     int total = 0;
-    char tmp[1];
-    while (total < (int)sizeof(raw) - 1) {
-        int n = recv(client_fd, tmp, 1, 0);
+    char c;
+    while (total < bufsz - 1) {
+        int n = recv(fd, &c, 1, 0);
         if (n <= 0) break;
-        raw[total++] = tmp[0];
-        /* Detect end of headers */
+        buf[total++] = c;
         if (total >= 4 &&
-            raw[total-4] == '\r' && raw[total-3] == '\n' &&
-            raw[total-2] == '\r' && raw[total-1] == '\n')
+            buf[total-4]=='\r' && buf[total-3]=='\n' &&
+            buf[total-2]=='\r' && buf[total-1]=='\n')
             break;
     }
-    raw[total] = '\0';
+    buf[total] = '\0';
+    return total;
+}
 
-    if (total == 0) return 0;   /* empty request */
+/* ════════════════════════════════════════════════════════
+ *  Parse request line + extract host/port/path
+ *
+ *  Returns:  1 = OK (GET)
+ *            0 = 400 Bad Request
+ *           -1 = 501 Not Implemented
+ * ════════════════════════════════════════════════════════ */
+int parse_request(const char *raw, HTTPRequest *req) {
+    /* --- pull out first line --- */
+    char req_line[1024];
+    const char *eol = strstr(raw, "\r\n");
+    if (!eol) {
+        /* try bare \n (some tools) */
+        eol = strchr(raw, '\n');
+        if (!eol) return 0;
+    }
+    int len = (int)(eol - raw);
+    if (len >= (int)sizeof(req_line)) return 0;
+    strncpy(req_line, raw, len);
+    req_line[len] = '\0';
 
-    /* ── Extract the first (request) line ── */
-    char req_line[512];
-    char *eol = strstr(raw, "\r\n");
-    if (!eol) return 0;
-
-    int req_line_len = (int)(eol - raw);
-    if (req_line_len >= (int)sizeof(req_line)) return 0;
-    strncpy(req_line, raw, req_line_len);
-    req_line[req_line_len] = '\0';
-
-    /* ── Parse method, URL, version from request line ── */
+    /* --- parse: METHOD URL VERSION --- */
     char url[4096];
     memset(req->method,  0, sizeof(req->method));
     memset(url,          0, sizeof(url));
@@ -138,18 +113,21 @@ int parse_request(int client_fd, HTTPRequest *req) {
                req->method, url, req->version) != 3)
         return 0;
 
-    /* ── Validate HTTP version ── */
+    /* version must start with HTTP/ */
     if (strncmp(req->version, "HTTP/", 5) != 0) return 0;
 
-    /* ── Check method ── */
-    if (strcasecmp(req->method, "GET") != 0) return -1; /* 501 */
+    /* CONNECT = used for HTTPS tunnelling → 501 */
+    if (strcasecmp(req->method, "CONNECT") == 0) return -1;
 
-    /* ── Parse the absolute URI: http://host[:port]/path ── */
-    if (strncasecmp(url, "http://", 7) != 0) return 0;   /* 400 */
+    /* any method other than GET → 501 */
+    if (strcasecmp(req->method, "GET") != 0) return -1;
+
+    /* must be absolute URI: http://host... */
+    if (strncasecmp(url, "http://", 7) != 0) return 0;
 
     char *host_start = url + 7;
 
-    /* Find where host ends (either '/' or end of string) */
+    /* split host:port from path */
     char *path_start = strchr(host_start, '/');
     char host_port[256];
     memset(host_port, 0, sizeof(host_port));
@@ -158,259 +136,229 @@ int parse_request(int client_fd, HTTPRequest *req) {
         int hp_len = (int)(path_start - host_start);
         if (hp_len >= (int)sizeof(host_port)) return 0;
         strncpy(host_port, host_start, hp_len);
-        strncpy(req->path, path_start, sizeof(req->path) - 1);
+        strncpy(req->path, path_start, sizeof(req->path)-1);
     } else {
-        strncpy(host_port, host_start, sizeof(host_port) - 1);
+        strncpy(host_port, host_start, sizeof(host_port)-1);
         strcpy(req->path, "/");
     }
-
     if (strlen(req->path) == 0) strcpy(req->path, "/");
 
-    /* ── Split host and port ── */
+    /* split host and port */
     char *colon = strchr(host_port, ':');
     if (colon) {
-        int host_len = (int)(colon - host_port);
-        if (host_len >= (int)sizeof(req->host)) return 0;
-        strncpy(req->host, host_port, host_len);
-        req->host[host_len] = '\0';
+        int hl = (int)(colon - host_port);
+        if (hl >= (int)sizeof(req->host)) return 0;
+        strncpy(req->host, host_port, hl);
+        req->host[hl] = '\0';
         req->port = atoi(colon + 1);
         if (req->port <= 0 || req->port > 65535) return 0;
     } else {
-        strncpy(req->host, host_port, sizeof(req->host) - 1);
+        strncpy(req->host, host_port, sizeof(req->host)-1);
         req->port = DEFAULT_HTTP_PORT;
     }
 
     if (strlen(req->host) == 0) return 0;
-
-    /* ── Store remaining headers (after request line) ── */
-    char *headers_start = eol + 2;  /* skip \r\n */
-    strncpy(req->headers, headers_start, sizeof(req->headers) - 1);
-
-    return 1; /* success */
+    return 1;
 }
 
-/* ══════════════════════════════════════════════════════════════
- *  Connect to Remote Server
- * ══════════════════════════════════════════════════════════════ */
-
+/* ════════════════════════════════════════════════════════
+ *  Connect TCP to remote host:port
+ * ════════════════════════════════════════════════════════ */
 int connect_to_server(const char *host, int port) {
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_UNSPEC;    /* IPv4 or IPv6 */
+    hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
     if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-        fprintf(stderr, "[proxy] getaddrinfo failed for host: %s\n", host);
+        fprintf(stderr, "[proxy] DNS lookup failed: %s\n", host);
         return -1;
     }
 
     int sockfd = -1;
-    for (rp = res; rp != NULL; rp = rp->ai_next) {
+    for (rp = res; rp; rp = rp->ai_next) {
         sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (sockfd < 0) continue;
-        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0) break; /* success */
+        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0) break;
         close(sockfd);
         sockfd = -1;
     }
     freeaddrinfo(res);
-    return sockfd;  /* -1 on failure */
+    return sockfd;
 }
 
-/* ══════════════════════════════════════════════════════════════
- *  Handle a Single Client (runs in child process)
- * ══════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════
+ *  Handle one client (runs inside child process)
+ * ════════════════════════════════════════════════════════ */
+void handle_client(int cfd, struct sockaddr_in *caddr) {
+    /* log client IP */
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &caddr->sin_addr, ip, sizeof(ip));
 
-void handle_client(int client_fd, struct sockaddr_in *client_addr) {
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client_addr->sin_addr, client_ip, sizeof(client_ip));
-    printf("[proxy] New connection from %s:%d\n",
-           client_ip, ntohs(client_addr->sin_port));
+    /* read full request headers */
+    char raw[MAX_HEADER_SIZE];
+    int  rawlen = read_headers(cfd, raw, sizeof(raw));
+    if (rawlen == 0) { close(cfd); return; }
 
-    /* ── Parse the HTTP request ── */
+    /* debug: print first line received */
+    char first[256] = {0};
+    const char *nl = strchr(raw, '\n');
+    if (nl) {
+        int fl = (int)(nl - raw);
+        if (fl > 254) fl = 254;
+        strncpy(first, raw, fl);
+        /* strip \r */
+        if (fl > 0 && first[fl-1]=='\r') first[fl-1]='\0';
+    }
+    printf("[proxy] From %s:%d  →  %s\n", ip, ntohs(caddr->sin_port), first);
+
+    /* parse */
     HTTPRequest req;
     memset(&req, 0, sizeof(req));
-    int parse_result = parse_request(client_fd, &req);
+    int result = parse_request(raw, &req);
 
-    if (parse_result == 0) {
-        fprintf(stderr, "[proxy] 400 Bad Request from %s\n", client_ip);
-        send_400(client_fd);
-        close(client_fd);
-        return;
+    if (result == 0) {
+        fprintf(stderr, "[proxy] 400 – bad request from %s\n", ip);
+        send_error(cfd, 400, "Bad Request",
+                   "Your browser sent a request the proxy could not understand.");
+        close(cfd); return;
     }
-    if (parse_result == -1) {
-        fprintf(stderr, "[proxy] 501 Not Implemented from %s (method: %s)\n",
-                client_ip, req.method);
-        send_501(client_fd);
-        close(client_fd);
-        return;
-    }
-
-    printf("[proxy] %s http://%s:%d%s\n",
-           req.method, req.host, req.port, req.path);
-
-    /* ── Connect to the remote server ── */
-    int server_fd = connect_to_server(req.host, req.port);
-    if (server_fd < 0) {
-        fprintf(stderr, "[proxy] Could not connect to %s:%d\n",
-                req.host, req.port);
-        send_error(client_fd, 502, "Bad Gateway",
-                   "The proxy could not connect to the remote server.");
-        close(client_fd);
-        return;
+    if (result == -1) {
+        fprintf(stderr, "[proxy] 501 – method not supported: %s from %s\n",
+                req.method, ip);
+        send_error(cfd, 501, "Not Implemented",
+                   "This proxy only supports the GET method. "
+                   "HTTPS (CONNECT) is not supported.");
+        close(cfd); return;
     }
 
-    /* ── Build and send forward request to the real server ── */
-    char forward[MAX_HEADER_SIZE + 512];
-    snprintf(forward, sizeof(forward),
+    printf("[proxy] Forwarding GET http://%s:%d%s\n",
+           req.host, req.port, req.path);
+
+    /* connect to origin server */
+    int sfd = connect_to_server(req.host, req.port);
+    if (sfd < 0) {
+        fprintf(stderr, "[proxy] Cannot reach %s:%d\n", req.host, req.port);
+        send_error(cfd, 502, "Bad Gateway",
+                   "Proxy could not connect to the remote server.");
+        close(cfd); return;
+    }
+
+    /* forward clean HTTP/1.0 request to server */
+    char fwd[MAX_HEADER_SIZE];
+    snprintf(fwd, sizeof(fwd),
              "GET %s HTTP/1.0\r\n"
              "Host: %s\r\n"
              "Connection: close\r\n"
              "\r\n",
              req.path, req.host);
 
-    if (send(server_fd, forward, strlen(forward), 0) < 0) {
-        fprintf(stderr, "[proxy] send to server failed\n");
-        send_error(client_fd, 502, "Bad Gateway", "Failed to forward request.");
-        close(server_fd);
-        close(client_fd);
-        return;
+    if (send(sfd, fwd, strlen(fwd), 0) < 0) {
+        send_error(cfd, 502, "Bad Gateway", "Failed to forward request.");
+        close(sfd); close(cfd); return;
     }
 
-    /* ── Relay response from server → client ── */
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes;
-    long total_bytes = 0;
-
-    while ((bytes = recv(server_fd, buffer, sizeof(buffer), 0)) > 0) {
+    /* relay response bytes: server → client */
+    char buf[BUFFER_SIZE];
+    ssize_t n;
+    long total = 0;
+    while ((n = recv(sfd, buf, sizeof(buf), 0)) > 0) {
         ssize_t sent = 0;
-        while (sent < bytes) {
-            ssize_t s = send(client_fd, buffer + sent, bytes - sent, 0);
-            if (s < 0) {
-                fprintf(stderr, "[proxy] send to client failed\n");
-                goto done;
-            }
+        while (sent < n) {
+            ssize_t s = send(cfd, buf+sent, n-sent, 0);
+            if (s < 0) goto done;
             sent += s;
         }
-        total_bytes += bytes;
+        total += n;
     }
 
 done:
-    printf("[proxy] Done – transferred %ld bytes for %s%s\n",
-           total_bytes, req.host, req.path);
-
-    close(server_fd);
-    close(client_fd);
+    printf("[proxy] Done  %s%s  (%ld bytes)\n", req.host, req.path, total);
+    close(sfd);
+    close(cfd);
 }
 
-/* ══════════════════════════════════════════════════════════════
- *  main()
- * ══════════════════════════════════════════════════════════════ */
-
+/* ════════════════════════════════════════════════════════
+ *  main
+ * ════════════════════════════════════════════════════════ */
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
-        exit(EXIT_FAILURE);
+        exit(1);
     }
-
     int port = atoi(argv[1]);
     if (port <= 0 || port > 65535) {
-        fprintf(stderr, "Invalid port number: %s\n", argv[1]);
-        exit(EXIT_FAILURE);
+        fprintf(stderr, "Invalid port: %s\n", argv[1]);
+        exit(1);
     }
 
-    /* ── Set up SIGCHLD handler to reap zombies ── */
+    /* reap zombie children */
     struct sigaction sa;
     sa.sa_handler = sigchld_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     sigaction(SIGCHLD, &sa, NULL);
 
-    /* ── Create listening socket ── */
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
+    /* listening socket */
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { perror("socket"); exit(1); }
+
+    int opt = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in saddr;
+    memset(&saddr, 0, sizeof(saddr));
+    saddr.sin_family      = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY;
+    saddr.sin_port        = htons(port);
+
+    if (bind(lfd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
+        perror("bind"); close(lfd); exit(1);
     }
-
-    /* Allow reuse of port immediately after restart */
-    int optval = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-
-    /* ── Bind to the specified port on all interfaces ── */
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family      = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port        = htons(port);
-
-    if (bind(listen_fd, (struct sockaddr *)&server_addr,
-             sizeof(server_addr)) < 0) {
-        perror("bind");
-        close(listen_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(listen_fd, MAX_PROCESSES) < 0) {
-        perror("listen");
-        close(listen_fd);
-        exit(EXIT_FAILURE);
+    if (listen(lfd, MAX_PROCESSES) < 0) {
+        perror("listen"); close(lfd); exit(1);
     }
 
     printf("╔══════════════════════════════════════════╗\n");
-    printf("║   HTTP Proxy Server – CS3001 Assign #1   ║\n");
-    printf("║   FAST-NUCES Karachi  –  Spring 2026     ║\n");
+    printf("║   HTTP Proxy Server  –  CS3001 Asgn #1   ║\n");
+    printf("║   FAST-NUCES Karachi  |  Spring 2026     ║\n");
     printf("╚══════════════════════════════════════════╝\n");
-    printf("[proxy] Listening on port %d ...\n\n", port);
+    printf("[proxy] Listening on port %d\n\n", port);
 
-    /* ── Main accept loop ── */
+    /* accept loop */
     while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-
-        int client_fd = accept(listen_fd,
-                               (struct sockaddr *)&client_addr,
-                               &client_len);
-        if (client_fd < 0) {
-            if (errno == EINTR) continue;   /* interrupted by signal – retry */
-            perror("accept");
-            continue;
+        struct sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        int cfd = accept(lfd, (struct sockaddr*)&caddr, &clen);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept"); continue;
         }
 
-        /* Enforce maximum concurrent process limit */
         if (child_count >= MAX_PROCESSES) {
-            fprintf(stderr,
-                    "[proxy] Max processes (%d) reached – dropping connection\n",
-                    MAX_PROCESSES);
-            send_error(client_fd, 503, "Service Unavailable",
-                       "Proxy is at capacity. Please try again later.");
-            close(client_fd);
-            continue;
+            send_error(cfd, 503, "Service Unavailable",
+                       "Proxy at capacity – try again later.");
+            close(cfd); continue;
         }
 
-        /* Fork a child to handle the request */
         pid_t pid = fork();
-
-        if (pid < 0) {
-            perror("fork");
-            close(client_fd);
-            continue;
-        }
+        if (pid < 0) { perror("fork"); close(cfd); continue; }
 
         if (pid == 0) {
-            /* ── Child process ── */
-            close(listen_fd);           /* child doesn't need the listen socket */
-            handle_client(client_fd, &client_addr);
-            exit(EXIT_SUCCESS);
+            /* child */
+            close(lfd);
+            handle_client(cfd, &caddr);
+            exit(0);
         }
 
-        /* ── Parent process ── */
+        /* parent */
         child_count++;
-        close(client_fd);           /* parent doesn't handle this client */
+        close(cfd);
     }
 
-    close(listen_fd);
+    close(lfd);
     return 0;
 }
